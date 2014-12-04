@@ -44,7 +44,7 @@ class MotherforkingClient
   end
   
   def copy_labels()
-    raise "implement me"
+    @new_repo.set_labels(@old_repo.labels)
   end
   
   def copy_issues()
