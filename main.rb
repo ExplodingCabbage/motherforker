@@ -1,4 +1,5 @@
 #!/usr/bin/env ruby
+$VERBOSE = true
 
 # Require all gems
 require "rubygems"
