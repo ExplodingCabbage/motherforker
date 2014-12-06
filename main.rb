@@ -11,4 +11,4 @@ $LOAD_PATH.unshift File.dirname(__FILE__)
 
 # Load everything (nicked from http://stackoverflow.com/a/1849985)
 # This is just here as a temporary hack to make testing from the REPL easier
-Dir["#{File.dirname(__FILE__)}/**/*.rb"].each { |f| require(f) }
+Dir["#{File.dirname(__FILE__)}/**/*.rb"].each { |f| require(f) unless f.include?("main.rb") }
