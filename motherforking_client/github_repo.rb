@@ -91,6 +91,109 @@ class GithubRepo
     end
   end
   
+  def issues_and_pull_requests
+    Enumerator.new do |enum|
+      raw_issues = enumerate_paginated do
+        @octokit_client.list_issues(@repo_name, {
+          sort: "created",
+          direction: "asc",
+          state: "all"
+        })
+      end
+      raw_issues.each do |raw_issue|
+        raw_comments = @octokit_client.issue_comments(
+          @repo_name,
+          raw_issue[:number]
+        )
+        comments = raw_comments.map do |raw_comment|
+          {
+            id: raw_comment[:id],
+            author: raw_comment[:user][:login],
+            date: raw_comment[:created_at]
+          }
+        end
+        
+        is_pull_request = raw_issue.has_key?("pull_request")
+        
+        issue = {
+          number: raw_issue[:number],
+          url: raw_issue[:html_url],
+          title: raw_issue[:title],
+          body: raw_issue[:body],
+          labels: raw_issue[:labels].map { |label_hash| label_hash[:name] },
+          author: raw_issue[:user][:login],
+          date: raw_issue[:created_at],
+          closed: raw_issue[:state] == 'closed',
+          close_date: raw_issue[:closed_at],
+          comments: comments,
+          site: :github,
+          is_pull_request: is_pull_request
+        }
+        
+        if is_pull_request
+          raise "TODO: Implement me"
+        end
+        
+        enum.yield()
+      end
+    end
+  end
+  
+  # Takes an issue from some other repo and duplicates it on the new one.
+  # issue must be a hash with the following keys:
+  #   :number - the issue number
+  #   :url - link to the old issue
+  #   :title - issue title
+  #   :body - issue body in a Github-compatible format
+  #   :labels - array of label names
+  #   :author - name of original author
+  #   :date - a Time object representing the UTC time the issue was posted
+  #   :closed - boolean, whether the issue is closed
+  #   :close_date - optional Time only to be provided if the issue is closed
+  #   :comments - array of comments, each with an author, body and date
+  #   :site - the site - either :github, :googlecode or :bitbucket - on which
+  #           the issue was originally opened.
+  #
+  # Note that what this method does depends upon the state of the repo.
+  # * If the issue has already been copied (determined by baking a link to the
+  #   original issue into the copy) then it does nothing.
+  # * If the issue has not yet been copied, but cannot be copied in an
+  #   issue-number-preserving way (because the number has already been taken, 
+  #   or the immediately prior issue number has not yet been taken), then it
+  #   raises an exception.
+  # * Otherwise, it creates the issue.
+  def create_issue_if_not_exists(issue)
+    existing_issue = begin
+      @octokit_client.issue(@repo_name, issue[:number])
+    rescue Octokit::NotFound
+      nil
+    end
+    
+    if existing_issue.nil?
+      if issue[:number] != 1
+        begin
+          @octokit_client.issue(@repo_name, issue[:number]-1).nil?
+        rescue Octokit::NotFound
+          raise "Cannot create issue\n#{issue.to_s}\nbecause the previous "\
+                "issue does not yet exist."
+        end
+      end
+      
+      create_issue(issue)
+    elsif existing_issue[:body].include? issue[:url]
+      # Issue has already been created on a previous pass; perhaps we crashed
+      # after creating it?
+      # Anyway, nothing more to do.
+      return
+    else
+      raise "An issue with the desired ID already exists, but it seems to be "\
+            "a separate issue from the one we're trying to create now; the "\
+            "motherforker always creates issues containing a link back to "\
+            "the original, but there is no such link in this case.\n"\
+            "Issue that caused the failure:\n" + issue.to_s
+    end      
+  end
+  
   private
   
   # Takes a block that should perform a GET using @octokit_client and yield the
@@ -110,7 +213,7 @@ class GithubRepo
   # Returns an enumerator that does all of the above.
   def enumerate_paginated
     current_page = yield
-    next_page_relation = c.last_response.rels[:next]
+    next_page_relation = @octokit_client.last_response.rels[:next]
     return Enumerator.new { |enum|
       loop do
         current_page.each { |issue|
@@ -118,9 +221,91 @@ class GithubRepo
         }
         break if next_page_relation.nil?
         current_page = next_page_relation.get.data
-        next_page_relation = c.last_response.rels[:next]
+        next_page_relation = @octokit_client.last_response.rels[:next]
       end
     }
+  end
+  
+  def create_issue(issue)
+    # A hack: we don't want to notify everybody mentioned in the issue upon its
+    # creation (since that would be really obnoxious and spam the fuck out of
+    # everybody who was involved with the previous repo.) We avoid this by
+    # creating all our posts with empty bodies and then editing their content.
+    # Editing posts on GitHub does not generate notifications.
+    new_issue = @octokit_client.create_issue(@repo_name, issue[:title], '')
+    if new_issue[:number] != issue[:number]
+      raise "Huh? newly created issue doesn't have the issue number expected"
+    end
+    
+    @octokit_client.update_issue(@repo_name, issue[:number], {
+      body: body_for_issue(issue),
+      state: issue[:closed] ? 'closed' : 'open',
+      labels: issue[:labels]
+    })
+    
+    issue[:comments].each do |comment|
+      # We apply the same hack that we used for the issue itself - we create
+      # a placeholder comment first, then edit its contents, thus avoiding
+      # notifying anybody.
+      new_comment = @octokit_client.add_comment(
+        @repo_name,
+        issue[:number],
+        "I am a placeholder."
+      )
+      
+      @octokit_client.update_comment(
+        @repo_name,
+        new_comment[:id],
+        body_for_comment(comment, issue[:site])
+      )
+    end
+    
+    if issue[:closed]
+      formatted_date = issue[:close_date].strftime("%Y-%m-%d at %H:%M (UTC)")
+      @octokit_client.add_comment(
+        @repo_name,
+        issue[:number],
+        "Motherforker note: this issue was originally closed on #{formatted_date}."
+      )
+    end
+  end
+  
+  # Spits out a new body for the issue. This will just consist of the old body
+  # with a header on top reading something along the lines of:
+  #
+  #     Issue originally opened by @ExplodingCabbage on 2014-05-02.
+  #     Original issue: https://github.com/ExplodingCabbage/somerepo/issues/3
+  def body_for_issue(issue)
+    if issue[:site] == :github
+      username = '@' + issue[:author]
+    else
+      username = issue[:author]
+    end
+    
+    formatted_date = issue[:date].strftime("%Y-%m-%d at %H:%M (UTC)")
+    header = "Issue originally opened by #{username} on #{formatted_date}, "\
+             "and migrated by the [Motherforker](https://github.com/ExplodingCabbage/motherforker).\n\n"\
+             "Original issue: #{issue[:url]}\n\n"\
+             "----------------------------------------------\n\n"
+             
+    return header + issue[:body]
+  end
+  
+  # Analagous to body_for_issue, but for comments
+  def body_for_comment(comment, site)
+    if site == :github
+      username = '@' + comment[:author]
+    else
+      username = comment[:author]
+    end
+    
+    formatted_date = comment[:date].strftime("%Y-%m-%d at %H:%M (UTC)")
+    header = "comment originally posted by #{username} on #{formatted_date}, "\
+             "and migrated by the [Motherforker](https://github.com/ExplodingCabbage/motherforker).\n\n"\
+             "Original comment: #{comment[:url]}\n\n"\
+             "----------------------------------------------\n\n"
+             
+    return header + comment[:body]
   end
   
   def full_name_from_url(repo_url)
